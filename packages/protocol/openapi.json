@@ -16802,7 +16802,7 @@
           "freeform": {
             "type": "array",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/Tool.FreeformFormat"
             }
           },
           "input": {
@@ -20494,7 +20494,7 @@
           "freeform": {
             "type": "array",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/Tool.FreeformFormat"
             }
           },
           "input": {
@@ -25062,6 +25062,10 @@
         },
         "required": ["type", "uri", "mime"],
         "additionalProperties": false
+      },
+      "Tool.FreeformFormat": {
+        "type": "string",
+        "enum": ["text", "regex", "lark"]
       },
       "Tool.TextContent": {
         "type": "object",
