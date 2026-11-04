@@ -2,6 +2,7 @@ import { createMemo, type Accessor } from "solid-js"
 import type { SessionInfo } from "@opencode/client/promise"
 import { useGlobal, useServerCtx, type ServerCtx } from "@/runtime/server/runtime"
 import { sessionPermissionRequest, sessionFormRequest } from "@/session/requests/session-request-tree"
+import { needsUser } from "@/session/requests/auto-approve-machine"
 import { ServerConnection } from "@/runtime/server/registry"
 import { projectSettingsKey, useSettings } from "@/settings/model"
 
@@ -26,7 +27,7 @@ export function useSessionTabAvatarState(
 
     const project = projectSettingsKey(ctx.sdk.scope, ctx.data.session.get(sessionId())?.projectID)
 
-    return sessionRequests(ctx.data, sessionId(), !!root?.(), settings.permissions.autoApproves(project))
+    return sessionRequests(ctx, sessionId(), !!root?.(), settings.permissions.autoApproves(project))
   })
 
   const needsAttention = createMemo(() => requests().permission || requests().form)
@@ -53,8 +54,11 @@ export function useSessionTabAvatarState(
   return { unread, loading, attention: needsAttention }
 }
 
-// Pending permission and form requests anywhere in the session (or its family, for roots).
-export function sessionRequests(data: ServerData, sessionId: string, root: boolean, autoApprove: boolean) {
+// Pending permission and form requests anywhere in the session (or its family, for roots). A permission counts by
+// the same rule as the dock, so one auto-approve gave up on still marks the session.
+export function sessionRequests(ctx: ServerCtx, sessionId: string, root: boolean, autoApprove: boolean) {
+  const data = ctx.data
+
   const sessions = root
     ? [...new Set([sessionId, ...data.session.family(sessionId)])].flatMap((id) => {
         const info = data.session.get(id)
@@ -64,7 +68,9 @@ export function sessionRequests(data: ServerData, sessionId: string, root: boole
     : data.session.list()
 
   return {
-    permission: !autoApprove && !!sessionPermissionRequest(sessions, data.session.permission.list, sessionId),
+    permission: !!sessionPermissionRequest(sessions, data.session.permission.list, sessionId, (item) =>
+      needsUser(ctx.autoApprove.state(item.id), autoApprove),
+    ),
     form: !!sessionFormRequest(sessions, data.session.form.list, sessionId),
   }
 }
