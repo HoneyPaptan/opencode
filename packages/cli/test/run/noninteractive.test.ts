@@ -100,6 +100,43 @@ function executionFailed(message: string): V2Event {
   }
 }
 
+function idleMessage(outcome: "succeeded" | "failed" = "succeeded"): SessionMessageInfo {
+  return {
+    id: "msg_idle",
+    type: "idle",
+    outcome,
+    ...(outcome === "failed" ? { error: { type: "provider.transport" as const, message: "Execution failed" } } : {}),
+    time: { created: 5 },
+  }
+}
+
+// A step that failed and was retried, followed by the step that recovered.
+function recoveredMessages(outcome: "succeeded" | "failed") {
+  return (messageID: string): SessionMessageInfo[] => [
+    idleMessage(outcome),
+    {
+      id: "msg_recovered",
+      type: "assistant",
+      agent: "build",
+      model: { providerID: "test", id: "test-model" },
+      content: [{ type: "text", text: "Recovered answer" }],
+      finish: "stop",
+      time: { created: 3, completed: 4 },
+    },
+    {
+      id: "msg_assistant",
+      type: "assistant",
+      agent: "build",
+      model: { providerID: "test", id: "test-model" },
+      content: [],
+      finish: "error",
+      error: { type: "provider.transport", message: "Recovered transport error" },
+      time: { created: 2, completed: 3 },
+    },
+    { id: messageID, type: "user", text: "hello", time: { created: 1 } },
+  ]
+}
+
 function failedTool(inboxID: string): V2Event[] {
   return [
     prompted(inboxID),
@@ -370,6 +407,7 @@ describe("runNonInteractivePrompt", () => {
       turn: (messageID) => [prompted(messageID)],
       wait: () => idle.promise,
       messages: (messageID) => [
+        idleMessage(),
         {
           id: "msg_assistant",
           type: "assistant",
@@ -405,6 +443,7 @@ describe("runNonInteractivePrompt", () => {
   test("reports usage for a step that ends after the Session goes idle", async () => {
     const tokens = { input: 3, output: 5, reasoning: 7, cache: { read: 11, write: 13 } }
     const assistant = (messageID: string): SessionMessageInfo[] => [
+      idleMessage(),
       {
         id: "msg_assistant",
         type: "assistant",
@@ -481,6 +520,76 @@ describe("runNonInteractivePrompt", () => {
       expect(output.exitCode).toBe(1)
       expect(output.stdout).toContain("selection unavailable")
     }
+  })
+
+  test("a recovered step failure exits 0 and still waits for background work", async () => {
+    const lists: ExperimentalJobListOutput[] = [[shellJob("sh_train", "python train.py")], []]
+    const output = await capture({
+      format: "json",
+      jobs: () => lists.shift() ?? [],
+      messages: recoveredMessages("succeeded"),
+      turn: (id) => [
+        prompted(id),
+        stepStarted(),
+        stepFailed("Recovered transport error"),
+        settled(),
+        {
+          id: "evt_text",
+          created: 2,
+          type: "session.text.ended",
+          durable: { aggregateID: "ses_1", seq: 2, version: 1 },
+          data: { sessionID: "ses_1", assistantMessageID: "msg_2", ordinal: 0, text: "Training finished." },
+        },
+        settled(),
+      ],
+    })
+    expect(output.exitCode).toBe(0)
+    expect(output.stdout).toContain("Training finished.")
+    expect(output.stdout).not.toContain('"type":"error"')
+    expect(lists).toEqual([])
+  })
+
+  for (const live of [true, false]) {
+    test(`a terminal failure outcome exits 1 (${live ? "live" : "projected"})`, async () => {
+      const output = await capture({
+        format: "json",
+        turn: (messageID) => [
+          prompted(messageID),
+          stepFailed("Recovered transport error"),
+          ...(live ? [executionFailed("Execution failed")] : []),
+        ],
+        messages: recoveredMessages("failed"),
+        ...(live ? {} : { wait: () => Promise.resolve() }),
+      })
+      const errors = output.stdout
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .filter((event) => event.type === "error")
+      expect(output.exitCode).toBe(1)
+      expect(errors).toEqual([
+        expect.objectContaining({ error: expect.objectContaining({ message: "Execution failed" }) }),
+      ])
+    })
+  }
+
+  test("explains why a cancelled form fails the run", async () => {
+    const output = await capture({
+      format: "json",
+      pendingForms: [form("frm_pending", "ses_1")],
+      turn: (messageID) => [prompted(messageID), formCreated(form("frm_pending", "ses_1")), settled()],
+    })
+    const errors = output.stdout
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.type === "error")
+    expect(output.exitCode).toBe(1)
+    expect(errors).toEqual([
+      expect.objectContaining({
+        error: expect.objectContaining({ message: expect.stringContaining("cannot complete a form") }),
+      }),
+    ])
   })
 
   test("cancels session and global form blockers and exits on pre-promotion interrupt", async () => {

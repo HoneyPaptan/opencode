@@ -91,6 +91,7 @@ export async function runNonInteractivePrompt(input: Input) {
   let submitted = false
   let promoted = false
   let emittedError = false
+  let consumed = false
   let permissionRejected = false
   let formCancelled = false
   let interrupted = false
@@ -233,8 +234,16 @@ export async function runNonInteractivePrompt(input: Input) {
       if (!formAlreadySettled(error)) throw error
     }
     if (continuing) return
+    if (input.compatibility !== "v1" && !formCancelled) {
+      const error = {
+        type: "aborted",
+        message: "This non-interactive run cannot complete a form; the form was cancelled.",
+      }
+      emittedError = true
+      process.exitCode = 1
+      if (!emit("error", Date.now(), { error })) UI.error(error.message)
+    }
     formCancelled = true
-    if (input.compatibility !== "v1") process.exitCode = 1
   }
 
   const consume = async () => {
@@ -562,7 +571,8 @@ export async function runNonInteractivePrompt(input: Input) {
           v1InvalidOutput = true
           continue
         }
-        if (interrupted || permissionRejected || formCancelled) continue
+        // The runner may recover from a failed step; only the execution's outcome decides failure.
+        if (input.compatibility !== "v1" || interrupted || permissionRejected || formCancelled) continue
         flushStep()
         emittedError = true
         process.exitCode = 1
@@ -740,19 +750,25 @@ export async function runNonInteractivePrompt(input: Input) {
           },
         })
       }
-
-      // A declined tool call ends its step with an interrupted-step error that is
-      // only a consequence of our own rejection; it was already reported above.
-      if (message.error && !emittedError && !permissionRejected && !formCancelled) {
-        emittedError = true
-        process.exitCode = 1
-        if (!emit("error", timestamp, { error: message.error })) UI.error(message.error.message)
-      }
     }
-    return {
-      found: projected.found,
-      responded: projected.messages.some((message) => message.type === "assistant"),
+    // The idle marker records how the execution ended, so an error in a step the runner recovered
+    // from is not fatal. A terminal event the live stream already handled stays authoritative.
+    const terminal = projected.messages.findLast((message) => message.type === "idle")
+    if (
+      terminal &&
+      terminal.outcome !== "succeeded" &&
+      !consumed &&
+      !emittedError &&
+      !interrupted &&
+      !permissionRejected &&
+      !formCancelled
+    ) {
+      const error = terminal.error ?? { type: "aborted", message: `Session ${terminal.outcome}` }
+      emittedError = true
+      process.exitCode = 1
+      if (!emit("error", terminal.time.created, { error })) UI.error(error.message)
     }
+    return { found: projected.found, terminal }
   }
 
   const interrupt = () => {
@@ -797,7 +813,9 @@ export async function runNonInteractivePrompt(input: Input) {
     const prepared = await Promise.all(input.files.map(prepareFile))
     if (interrupted) return
     submitted = true
-    completed = consume()
+    completed = consume().finally(() => {
+      consumed = true
+    })
     admission = new AbortController()
     const response = await input.client.session
       .prompt(
@@ -859,7 +877,7 @@ export async function runNonInteractivePrompt(input: Input) {
     finalizing = true
     const projected = await reconcile()
     if (
-      !projected.responded &&
+      !projected.terminal &&
       !interrupted &&
       !permissionRejected &&
       !formCancelled &&
