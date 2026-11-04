@@ -134,6 +134,35 @@ describe("Z.ai Images", () => {
       ),
   )
 
+  it.effect("accepts n=1 without sending it and rejects larger n before sending anything", () =>
+    Effect.gen(function* () {
+      const model = ZAI.configure({ apiKey: "test" }).image("glm-image")
+      const response = yield* ai.image.generate({ model, prompt: "A lighthouse", n: 1 })
+      expect(response.images).toHaveLength(1)
+
+      const error = yield* ai.image.generate({ model, prompt: "A lighthouse", n: 2 }).pipe(Effect.flip)
+      expect([error.reason._tag, "operation" in error.reason && error.reason.operation]).toEqual([
+        "UnsupportedOperation",
+        "media.n",
+      ])
+    }).pipe(
+      Effect.provide(
+        ImageClient.layer.pipe(
+          Layer.provide(
+            dynamicResponse((input) =>
+              Effect.sync(() => {
+                expect(JSON.parse(input.text)).toEqual({ model: "glm-image", prompt: "A lighthouse" })
+                return input.respond(JSON.stringify({ data: [{ url: "https://cdn.z.ai/generated.png" }] }), {
+                  headers: { "content-type": "application/json" },
+                })
+              }),
+            ),
+          ),
+        ),
+      ),
+    ),
+  )
+
   it.effect("rejects invalid response structures", () =>
     Effect.gen(function* () {
       const model = ZAI.configure({ apiKey: "test" }).image("model")
