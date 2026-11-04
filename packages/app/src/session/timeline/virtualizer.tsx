@@ -20,6 +20,7 @@ import {
   onCleanup,
   onMount,
   Show,
+  untrack,
   type Accessor,
   type JSX,
 } from "solid-js"
@@ -28,6 +29,23 @@ import { createMediaQuery } from "@solid-primitives/media"
 import type { createTimelineProjection } from "./projection"
 import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { filterVirtualIndexes } from "./virtual-items"
+import {
+  ACTIVATED,
+  CHECK_REQUESTED,
+  COLD_REVEAL_TIMEOUT,
+  coldMountFlushing,
+  coldMountHidden,
+  coldMountTailOnly,
+  createColdMountState,
+  DEACTIVATED,
+  DISPOSED,
+  SIZES_FLUSHED,
+  SIZES_FLUSHING,
+  transitionColdMount,
+  type ColdMountEffect,
+  type ColdMountEvent,
+  type ColdMountSample,
+} from "./cold-mount"
 import { prefersReducedMotion } from "@opencode/ui/motion"
 import { holdLandingWidth } from "@/shell/panel-motion"
 
@@ -117,7 +135,10 @@ export function createTimelineVirtualizer(input: Input) {
   const entry = cache.get(ownerSessionKey)
   const cached = entry?.presentationKey === input.presentationKey?.() ? entry : undefined
   const initialMeasurements = cached?.measurements
-  const coldBottomMount = !initialMeasurements?.length && input.pinned()
+  const [coldMount, setColdMount] = createSignal(createColdMountState(!initialMeasurements?.length && input.pinned()))
+  // Each flips once per mount, so the many hidden-phase transitions do not reach the rows or the range.
+  const coldHidden = createMemo(() => coldMountHidden(coldMount()))
+  const coldTailOnly = createMemo(() => coldMountTailOnly(coldMount()))
   const [listRoot, setListRoot] = createSignal<HTMLDivElement>()
   const [visibleArea, setVisibleArea] = createSignal<HTMLDivElement>()
   const [viewRoot, setViewRoot] = createSignal<HTMLDivElement>()
@@ -133,11 +154,10 @@ export function createTimelineVirtualizer(input: Input) {
   )
 
   const [rendering, setRendering] = createStore<{
-    initialTail: boolean
     scrollAdjustment: number
     /** A revealed tool or unread notice whose top edge stays put until the user scrolls. */
     anchor?: { key: string; partID?: string }
-  }>({ initialTail: coldBottomMount, scrollAdjustment: 0 })
+  }>({ scrollAdjustment: 0 })
 
   const rows = input.projection.rows
   const rowByKey = input.projection.rowByKey
@@ -164,7 +184,7 @@ export function createTimelineVirtualizer(input: Input) {
   const rangeExtractor = createMemo(() => {
     const id = input.projection.activeMessageID()
     const active = id ? (input.projection.messageLastRowIndex().get(id) ?? -1) : -1
-    const initialTail = rendering.initialTail && input.pinned()
+    const initialTail = coldTailOnly() && input.pinned()
     const anchored = rendering.anchor ? rowKeys().indexOf(rendering.anchor.key) : -1
 
     return (range: Range) => {
@@ -229,7 +249,6 @@ export function createTimelineVirtualizer(input: Input) {
   let endPending = false
   let reportOffset: ((offset: number, scrolling: boolean) => void) | undefined
   let reportRect: ((rect: { width: number; height: number }) => void) | undefined
-  let batchingColdSizes = false
   let landedNewMessages: string | undefined
   let readIntent = false
 
@@ -261,7 +280,8 @@ export function createTimelineVirtualizer(input: Input) {
   const readEnd = () => {
     const root = listRoot()
 
-    if (!active() || coldPending || !root || (newMessagesKey() && !readIntent) || !atReachableEnd(root)) return
+    if (!active() || untrack(coldHidden) || !root || (newMessagesKey() && !readIntent) || !atReachableEnd(root))
+      return
     input.onReadEnd?.()
     releaseReadMark()
   }
@@ -271,7 +291,7 @@ export function createTimelineVirtualizer(input: Input) {
 
     const root = listRoot()
 
-    if (coldPending || !key || key === landedNewMessages || !root?.isConnected) return false
+    if (untrack(coldHidden) || !key || key === landedNewMessages || !root?.isConnected) return false
 
     const anchor = rendering.anchor
 
@@ -348,7 +368,7 @@ export function createTimelineVirtualizer(input: Input) {
 
           if (root && !input.pinned() && !rendering.anchor && atReachableEnd(root)) input.onPin()
         })
-        settleColdBottom()
+        dispatchCold(CHECK_REQUESTED)
 
         if (!scrolling) readEnd()
         releaseReadMark()
@@ -359,7 +379,7 @@ export function createTimelineVirtualizer(input: Input) {
         virtualContent?.querySelectorAll<HTMLDivElement>("[data-index]").forEach(virtualizer.measureElement)
 
         if (input.pinned()) virtualizer.scrollToEnd()
-        settleColdBottom()
+        dispatchCold(CHECK_REQUESTED)
       })
     },
     initialOffset: () => (input.pinned() ? Number.MAX_SAFE_INTEGER : 0),
@@ -383,7 +403,7 @@ export function createTimelineVirtualizer(input: Input) {
       if (initial) {
         const size = instance.itemSizeCache.get(instance.options.getItemKey(instance.indexFromElement(element)))
 
-        if (size !== undefined || coldPending) return size ?? fallbackItemSize
+        if (size !== undefined || untrack(coldHidden)) return size ?? fallbackItemSize
       }
 
       return element.offsetHeight
@@ -391,7 +411,7 @@ export function createTimelineVirtualizer(input: Input) {
     scrollToFn: (offset, options, instance) => {
       if (!active()) return
 
-      if (batchingColdSizes && input.pinned()) return
+      if (coldMountFlushing(untrack(coldMount)) && input.pinned()) return
       setRendering("scrollAdjustment", 0)
 
       if (virtualContent) virtualContent.style.height = `${instance.getTotalSize()}px`
@@ -453,7 +473,7 @@ export function createTimelineVirtualizer(input: Input) {
       if (!active()) return
       // The hidden pinned mount needs one bottom write after the whole batch,
       // not a layout-forcing scroll adjustment for every measured row.
-      batchingColdSizes = coldPending && input.pinned()
+      dispatchCold(SIZES_FLUSHING)
       batch(() => {
         sizes.forEach(([index, value]) => {
           const row = rows()[index]
@@ -471,13 +491,13 @@ export function createTimelineVirtualizer(input: Input) {
           if (root) reportOffset?.(root.scrollTop, virtualizer.isScrolling)
         })
       })
-      batchingColdSizes = false
+      dispatchCold(SIZES_FLUSHED)
       pinAnchor()
 
-      if (coldPending) pinColdBottom()
-      settleColdBottom()
+      if (untrack(coldHidden)) pinColdBottom()
+      dispatchCold(CHECK_REQUESTED)
 
-      if (coldPending) return
+      if (untrack(coldHidden)) return
 
       landNewMessages()
 
@@ -653,7 +673,7 @@ export function createTimelineVirtualizer(input: Input) {
       else if (!landNewMessages() && input.pinned()) virtualizer.scrollToEnd()
 
       reportOffset?.(root.scrollTop, false)
-      settleColdBottom()
+      dispatchCold(CHECK_REQUESTED)
       readEnd()
     })
     input.setRevealPart?.(revealPart)
@@ -755,10 +775,9 @@ export function createTimelineVirtualizer(input: Input) {
   // restyle every rendered row each time.
   createEffect(() => listRoot()?.style.setProperty("--session-timeline-inset", `${bottomInset()}px`))
 
-  let coldPending = coldBottomMount
-  let settleQueued = false
   let contentObserver: MutationObserver | undefined
   let viewportObserver: ResizeObserver | undefined
+  let revealTimer: ReturnType<typeof setTimeout> | undefined
 
   // Within the zoom slack only a write finds the end the browser reaches: one that does not move proves the view is
   // already there, and one that does is undone before anything paints.
@@ -804,74 +823,114 @@ export function createTimelineVirtualizer(input: Input) {
     )
   }
 
-  const settleColdBottom = () => {
-    if (!active() || !coldPending || settleQueued) return
-    settleQueued = true
-    queueMicrotask(() => {
-      settleQueued = false
-      const root = listRoot()
+  // The machine decides; this only runs what it asks for. Its state is set before any effect runs, so a check
+  // requested again from inside a pin joins the running one.
+  function dispatchCold(event: ColdMountEvent) {
+    const current = untrack(coldMount)
+    const next = transitionColdMount(current, event)
 
-      if (!coldPending || !virtualContent?.isConnected || !root) return
-
-      if (virtualContent.querySelector(pendingMarkdown)) return
-
-      if (!root.clientHeight) return
-      // Markdown can finish before ResizeObserver delivers its new box. The
-      // normal measureElement path skips reads while scrolling; this gate needs
-      // current boxes before expanding the estimated range or revealing it.
-      virtualizer.elementsCache.forEach((element) => {
-        if (element.isConnected) virtualizer.resizeItem(virtualizer.indexFromElement(element), element.offsetHeight)
-      })
-
-      if (pendingSizes.size || pendingMeasurements()) return
-      const pinned = input.pinned()
-
-      // A pinned view rests at the end pinColdBottom reaches. Under page zoom that end can be more than a pixel short
-      // of scrollHeight - clientHeight, and TanStack keeps the offset it wrote rather than the one reached. Waiting
-      // for either distance to close never ends: each pass reported the offset again, which queued the next pass as
-      // a microtask, and the renderer froze.
-      if (pinned && !pinColdBottom()) return
-
-      // The scroll event must update the range before newly exposed rows can reveal.
-      if (
-        !pinned &&
-        root.scrollHeight > root.clientHeight &&
-        Math.abs((virtualizer.scrollOffset ?? 0) - root.scrollTop) > 1
-      )
-        return
-
-      if (rendering.initialTail) {
-        setRendering("initialTail", false)
-        settleColdBottom()
-
-        return
-      }
-
-      if (pendingSizes.size || pendingMeasurements() || virtualContent.querySelector(pendingMarkdown)) return
-      coldPending = false
-      contentObserver?.disconnect()
-      viewportObserver?.disconnect()
-      landNewMessages()
-      virtualContent.style.removeProperty("visibility")
-      readEnd()
-    })
+    if (next.state !== current) setColdMount(next.state)
+    next.effects.forEach(runColdEffect)
   }
 
-  onMount(() => {
-    if (!coldPending || !virtualContent) return
-    contentObserver = new MutationObserver(settleColdBottom)
-    contentObserver.observe(virtualContent, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["data-markdown-ready"],
-    })
-    viewportObserver = new ResizeObserver(settleColdBottom)
+  function runColdEffect(effect: ColdMountEffect) {
+    if (effect.type === "observe") {
+      if (!virtualContent) return
+      contentObserver = new MutationObserver(() => dispatchCold(CHECK_REQUESTED))
+      contentObserver.observe(virtualContent, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["data-markdown-ready"],
+      })
+      viewportObserver = new ResizeObserver(() => dispatchCold(CHECK_REQUESTED))
+      const root = listRoot()
+
+      if (root) viewportObserver.observe(root)
+
+      return
+    }
+
+    if (effect.type === "timer.start") {
+      clearTimeout(revealTimer)
+      revealTimer = setTimeout(() => dispatchCold({ type: "timeout", attempt: effect.attempt }), COLD_REVEAL_TIMEOUT)
+
+      return
+    }
+
+    if (effect.type === "timer.cancel") {
+      clearTimeout(revealTimer)
+
+      return
+    }
+
+    if (effect.type === "check.schedule") {
+      queueMicrotask(() => dispatchCold({ type: "check.ready", attempt: effect.attempt }))
+
+      return
+    }
+
+    if (effect.type === "check.sample") {
+      dispatchCold({ type: "check.sampled", attempt: effect.attempt, sample: sampleColdMount() })
+
+      return
+    }
+
+    // The fallback reveals whatever has rendered, at the end a pinned view follows.
+    if (effect.type === "pin") {
+      pinColdBottom()
+
+      return
+    }
+
+    if (effect.type === "reveal") {
+      landNewMessages()
+      readEnd()
+
+      return
+    }
+
+    clearTimeout(revealTimer)
+    contentObserver?.disconnect()
+    viewportObserver?.disconnect()
+  }
+
+  function sampleColdMount(): ColdMountSample {
     const root = listRoot()
 
-    if (root) viewportObserver.observe(root)
-    settleColdBottom()
-  })
+    if (!virtualContent?.isConnected || !root || virtualContent.querySelector(pendingMarkdown) || !root.clientHeight)
+      return "waiting"
+    // Markdown can finish before ResizeObserver delivers its new box. The
+    // normal measureElement path skips reads while scrolling; this gate needs
+    // current boxes before expanding the estimated range or revealing it.
+    virtualizer.elementsCache.forEach((element) => {
+      if (element.isConnected) virtualizer.resizeItem(virtualizer.indexFromElement(element), element.offsetHeight)
+    })
+
+    if (pendingSizes.size || pendingMeasurements()) return "waiting"
+    const pinned = input.pinned()
+
+    // A pinned view rests at the end pinColdBottom reaches. Under page zoom that end can be more than a pixel short
+    // of scrollHeight - clientHeight, and TanStack keeps the offset it wrote rather than the one reached. Waiting
+    // for either distance to close never ends: each pass reported the offset again, which queued the next pass as
+    // a microtask, and the renderer froze.
+    if (pinned && !pinColdBottom()) return "waiting"
+
+    // The scroll event must update the range before newly exposed rows can reveal.
+    if (
+      !pinned &&
+      root.scrollHeight > root.clientHeight &&
+      Math.abs((virtualizer.scrollOffset ?? 0) - root.scrollTop) > 1
+    )
+      return "waiting"
+
+    if (pendingSizes.size || pendingMeasurements() || virtualContent.querySelector(pendingMarkdown)) return "pinned"
+
+    return "settled"
+  }
+
+  onMount(() => dispatchCold({ type: "mounted", active: active() }))
+  createEffect(on(active, (value) => dispatchCold(value ? ACTIVATED : DEACTIVATED), { defer: true }))
 
   let measuredSessionKey = input.sessionKey()
   createEffect(() => {
@@ -893,7 +952,7 @@ export function createTimelineVirtualizer(input: Input) {
 
     if (active()) input.setScrollRef(root)
     viewportObserver?.observe(root)
-    settleColdBottom()
+    dispatchCold(CHECK_REQUESTED)
     // The scrollbar thumb sits beside the viewport and stops its pointerdown from propagating, so
     // listen on the ScrollView root in the capture phase: thumb drags are user scrolls too.
     const scrollView = root.parentElement
@@ -1029,7 +1088,7 @@ export function createTimelineVirtualizer(input: Input) {
     else if ((pointerHeld || touchScrolling) && scrollTop < previousTop - endEpsilon) input.onUnpin()
     // Probing the zoomed end now would cancel a scroll still in motion, so it waits for the scroll to settle.
     else if (arrived && !rendering.anchor && maxScroll - scrollTop <= zoomSlack) endPending = true
-    settleColdBottom()
+    dispatchCold(CHECK_REQUESTED)
     input.onScheduleScrollState(root)
     input.onHistoryScroll()
   }
@@ -1073,7 +1132,7 @@ export function createTimelineVirtualizer(input: Input) {
                 !Predicate.isTagged(row(), "UserMessage") ||
                 !addedKeys.has(rowProps.rowKey) ||
                 !input.pinned() ||
-                coldPending
+                coldHidden()
               )
                 return
               // The optimistic row can paint before ResizeObserver corrects the tail estimates.
@@ -1165,7 +1224,7 @@ export function createTimelineVirtualizer(input: Input) {
               width: "100%",
               // Rows held wider than the timeline mid-flight don't scroll it sideways.
               "overflow-x": "clip",
-              visibility: coldBottomMount ? "hidden" : undefined,
+              visibility: coldHidden() ? "hidden" : undefined,
             }}
           >
             <div
@@ -1211,9 +1270,7 @@ export function createTimelineVirtualizer(input: Input) {
     })
 
     while (cache.size > 16) cache.delete(cache.keys().next().value!)
-    coldPending = false
-    contentObserver?.disconnect()
-    viewportObserver?.disconnect()
+    dispatchCold(DISPOSED)
 
     if (active()) {
       input.setScrollRef(undefined)
